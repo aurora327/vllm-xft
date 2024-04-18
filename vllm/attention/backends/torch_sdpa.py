@@ -12,6 +12,8 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
 
+from xft_extension import xft_pageattention
+
 
 class TorchSDPABackend(AttentionBackend):
 
@@ -155,17 +157,45 @@ class TorchSDPABackendImpl(AttentionImpl):
                         att_masks = [None] * len(attn_metadata.prompt_lens)
                     attn_metadata.attn_bias = att_masks
 
+                '''
                 query = query.movedim(0, query.dim() - 2)
                 key = key.movedim(0, key.dim() - 2)
                 value = value.movedim(0, value.dim() - 2)
+                '''
+                query = query.view(num_tokens, self.num_heads * self.head_size)
+                key = key.view(num_tokens, self.num_kv_heads * self.head_size)
+                value = value.view(num_tokens, self.num_kv_heads * self.head_size)
 
                 start = 0
                 output = torch.empty(
                     (num_tokens, self.num_heads, self.head_size),
                     dtype=query.dtype)
+                dummy = torch.empty(1, dtype = torch.int) # placeholder for useless args TODO
                 for prompt_len, mask in zip(attn_metadata.prompt_lens,
                                             attn_metadata.attn_bias):
                     end = start + prompt_len
+                    sub_out = torch.empty(num_tokens,
+                            self.num_heads * self.head_size,
+                            dtype=query.dtype,
+                            device='cpu')
+                    xft_prompt_lens = [prompt_len] # need to change TODO
+                    xft_pageattention(sub_out,
+                                            query,
+                                            key,
+                                            value,
+                                            1,        # no need TODO 
+                                            self.scale,
+                                            xft_prompt_lens,
+                                            len(xft_prompt_lens), 
+                                            0,  # num_prompt_tokens no need TODO
+                                            self.head_size,
+                                            dummy,  # context len no need for prefill TODO
+                                            dummy,
+                                            dummy,
+                                            0,
+                                            dummy)
+                    sub_out = sub_out.view(num_tokens, self.num_heads, self.head_size)
+                    '''
                     sub_out = scaled_dot_product_attention(
                         query[:, start:end, :],
                         key[:, start:end, :],
@@ -174,13 +204,13 @@ class TorchSDPABackendImpl(AttentionImpl):
                         dropout_p=0.0,
                         is_causal=not self.need_mask,
                         scale=self.scale).movedim(query.dim() - 2, 0)
+                    '''
                     output[start:end, :, :] = sub_out
                     start = end
             else:
                 # prefix-enabled attention
                 raise RuntimeError(
                     "Torch SDPA backend doesn't support prefix decoding.")
-
         else:
             # Decoding run.
             output = PagedAttention.forward_decode(
@@ -196,7 +226,6 @@ class TorchSDPABackendImpl(AttentionImpl):
                 self.alibi_slopes,
                 kv_scale,
             )
-
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
 
